@@ -18,7 +18,7 @@ __all__ = (
     'ChannelLimitExceeded', 'ConnectionError', 'ChannelError',
     'VersionMismatch', 'SerializerNotInstalled', 'ResourceError',
     'SerializationError', 'EncodeError', 'DecodeError', 'HttpError',
-    'InconsistencyError',
+    'InconsistencyError', 'ConsumeLedgerProtected',
 )
 
 BaseExceptionType = TypeVar('BaseExceptionType', bound=BaseException)
@@ -91,6 +91,19 @@ class InconsistencyError(ConnectionError):
     """Data or environment has been found to be inconsistent.
 
     Depending on the cause it may be possible to retry the operation.
+    """
+
+
+class ConsumeLedgerProtected(KombuError):
+    """An inner consume-ledger scope attempted to invalidate a consumption
+    registration committed by an outer scope.
+
+    Raised when an explicit cancellation/detach step targets a consumer tag
+    or queue membership that was already committed before the innermost
+    ledger scope opened.  Bulk cancellation (``Consumer.cancel`` /
+    ``SimpleBase.close``) withholds such registrations instead; already
+    issued ``basic_cancel`` calls and detached queues are never rolled back
+    when a ledger scope exits.
     """
 
 

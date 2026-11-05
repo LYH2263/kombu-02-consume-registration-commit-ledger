@@ -19,6 +19,16 @@ from typing import TYPE_CHECKING
 
 from amqp.protocol import queue_declare_ok_t
 
+from kombu.consume_ledger import (
+    KIND_CHANNEL_CANCEL,
+    KIND_CHANNEL_CONSUME,
+    KIND_CHANNEL_GET,
+    STATUS_COMMITTED,
+    authorize_cancel,
+    consume_ledger as _open_consume_ledger,
+    ledger_for,
+    plane_of,
+)
 from kombu.exceptions import ChannelError, ResourceError
 from kombu.log import get_logger
 from kombu.transport import base
@@ -627,6 +637,20 @@ class Channel(AbstractChannel, base.StdChannel):
             routing_key=routing_key,
         )
 
+    def consume_ledger(self):
+        """Open a consumption registration & cancellation commit scope on
+        this channel."""
+        return _open_consume_ledger(self)
+
+    def _ledger_consume_extra(self, queue, no_ack):
+        # Transport specific facts merged into the channel_consume record
+        # (redis fanout/cycle, SQS noack/hub scheduling).
+        return {}
+
+    def _ledger_cancel_extra(self, consumer_tag, queue):
+        # Transport specific facts merged into the channel_cancel record.
+        return {}
+
     def basic_consume(self, queue, no_ack, callback, consumer_tag, **kwargs):
         """Consume from `queue`."""
         self._tag_to_queue[consumer_tag] = queue
@@ -643,27 +667,78 @@ class Channel(AbstractChannel, base.StdChannel):
 
         self._reset_cycle()
 
+        ledger = ledger_for(self)
+        if ledger is not None:
+            # Consumer-plane claims (if any) take precedence; this covers
+            # direct channel.basic_consume users as well.
+            ledger.claim_tag(consumer_tag, queue, id(self))
+            ledger.record(
+                plane=plane_of(self), kind=KIND_CHANNEL_CONSUME,
+                owner=id(self), queue=queue, tag=consumer_tag,
+                status=STATUS_COMMITTED,
+                callback_registered=True, active_queue_added=True,
+                consumer_added=True, cycle_reset=True,
+                no_ack=bool(no_ack),
+                **self._ledger_consume_extra(queue, bool(no_ack))
+            )
+
     def basic_cancel(self, consumer_tag):
         """Cancel consumer by consumer tag."""
         if consumer_tag in self._consumers:
+            # Refuse to tear a registration committed by an outer ledger
+            # frame through an inner frame on the same channel.
+            authorize_cancel(self, consumer_tag)
             self._consumers.remove(consumer_tag)
             self._reset_cycle()
             queue = self._tag_to_queue.pop(consumer_tag, None)
             try:
                 self._active_queues.remove(queue)
+                active_queue_removed = True
             except ValueError:
-                pass
-            self.connection._callbacks.pop(queue, None)
+                active_queue_removed = False
+            callback_removed = (
+                self.connection._callbacks.pop(queue, None) is not None
+            )
+
+            ledger = ledger_for(self)
+            if ledger is not None:
+                record = ledger.record(
+                    plane=plane_of(self), kind=KIND_CHANNEL_CANCEL,
+                    owner=id(self), queue=queue, tag=consumer_tag,
+                    status=STATUS_COMMITTED,
+                    callback_removed=callback_removed,
+                    active_queue_removed=active_queue_removed,
+                    cycle_reset=True,
+                    register_seq=ledger.register_seq(consumer_tag),
+                    **self._ledger_cancel_extra(consumer_tag, queue)
+                )
+                # Virtual completion plane: the structural teardown commits
+                # synchronously, so the claim drops immediately.
+                ledger.mark_cancelled(consumer_tag, record)
 
     def basic_get(self, queue, no_ack=False, **kwargs):
         """Get message by direct access (synchronous)."""
+        ledger = ledger_for(self)
         try:
             message = self.Message(self._get(queue), channel=self)
             if not no_ack:
                 self.qos.append(message, message.delivery_tag)
+            if ledger is not None:
+                ledger.record(
+                    plane=plane_of(self), kind=KIND_CHANNEL_GET,
+                    owner=id(self), queue=queue, tag=None,
+                    status=STATUS_COMMITTED,
+                    delivered=True, no_ack=bool(no_ack),
+                )
             return message
         except Empty:
-            pass
+            if ledger is not None:
+                ledger.record(
+                    plane=plane_of(self), kind=KIND_CHANNEL_GET,
+                    owner=id(self), queue=queue, tag=None,
+                    status=STATUS_COMMITTED,
+                    delivered=False, no_ack=bool(no_ack),
+                )
 
     def basic_ack(self, delivery_tag, multiple=False):
         """Acknowledge message."""

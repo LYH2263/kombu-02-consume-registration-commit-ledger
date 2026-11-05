@@ -67,6 +67,14 @@ from time import time
 from packaging.version import Version
 from vine import promise
 
+from kombu.consume_ledger import (
+    KIND_CHANNEL_CANCEL,
+    PLANE_REDIS,
+    STATUS_COMMITTED,
+    STATUS_DEFERRED,
+    authorize_cancel,
+    ledger_for,
+)
 from kombu.exceptions import InconsistencyError, VersionMismatch
 from kombu.log import get_logger
 from kombu.utils import symbol_by_name
@@ -829,6 +837,18 @@ class Channel(virtual.Channel):
     def _restore_at_beginning(self, message):
         return self._restore(message, leftmost=True)
 
+    def _ledger_consume_extra(self, queue, no_ack):
+        return {
+            'fanout': queue in self.active_fanout_queues,
+            'cycle_update': True,
+        }
+
+    def _ledger_cancel_extra(self, consumer_tag, queue):
+        detail = self.__dict__.get('_ledger_cancel_detail')
+        if detail is not None:
+            return dict(detail)
+        return {'cycle_updated': True}
+
     def basic_consume(self, queue, *args, **kwargs):
         if queue in self._fanout_queues:
             exchange, _ = self._fanout_queues[queue]
@@ -856,29 +876,80 @@ class Channel(virtual.Channel):
         # is complete (Issue celery/celery#1773).
         connection = self.connection
         if connection:
+            ledger = ledger_for(self)
             if connection.cycle._in_protected_read:
+                # Deferred completion plane: the structural teardown is
+                # only *scheduled* here; it commits from after_read once
+                # the protected read ends (and survives ledger scopes
+                # closing in the meantime).
+                deferred_seq = None
+                if ledger is not None:
+                    authorize_cancel(self, consumer_tag)
+                    deferred = ledger.record(
+                        plane=PLANE_REDIS, kind=KIND_CHANNEL_CANCEL,
+                        owner=id(self),
+                        queue=ledger.queue_of(consumer_tag),
+                        tag=consumer_tag, status=STATUS_DEFERRED,
+                        after_read=True,
+                        register_seq=ledger.register_seq(consumer_tag),
+                    )
+                    ledger.mark_cancel_pending(consumer_tag, deferred)
+                    deferred_seq = deferred.seq
                 return connection.cycle.after_read.add(
-                    promise(self._basic_cancel, (consumer_tag,)),
+                    promise(self._basic_cancel, (consumer_tag, deferred_seq)),
                 )
+            if ledger is not None:
+                authorize_cancel(self, consumer_tag)
             return self._basic_cancel(consumer_tag)
 
-    def _basic_cancel(self, consumer_tag):
+    def _basic_cancel(self, consumer_tag, deferred_seq=None):
+        ledger = ledger_for(self)
         try:
             queue = self._tag_to_queue[consumer_tag]
         except KeyError:
+            if ledger is not None and deferred_seq is not None:
+                # The tag vanished before the after_read callback ran;
+                # close the deferred commit fact honestly anyway.
+                ledger.record(
+                    plane=PLANE_REDIS, kind=KIND_CHANNEL_CANCEL,
+                    owner=id(self), queue=None, tag=consumer_tag,
+                    status=STATUS_COMMITTED, deferred_seq=deferred_seq,
+                    unknown_tag=True,
+                )
+                ledger.mark_cancelled(consumer_tag)
             return
+        fanout_removed = False
         try:
             self.active_fanout_queues.remove(queue)
         except KeyError:
             pass
         else:
+            fanout_removed = True
             self._unsubscribe_from(queue)
         try:
             exchange, _ = self._fanout_queues[queue]
             self._fanout_to_queue.pop(exchange)
         except KeyError:
             pass
-        ret = super().basic_cancel(consumer_tag)
+        if ledger is not None:
+            # Merge the redis completion facts into the single
+            # channel_cancel record emitted by the virtual plane.
+            self._ledger_cancel_detail = {
+                'fanout_removed': fanout_removed,
+                'unsubscribed': fanout_removed,
+                'cycle_updated': True,
+                'deferred_seq': deferred_seq,
+            }
+            # This is the trusted execution of a cancel that was already
+            # authorized when it was scheduled (possibly by an outer
+            # frame that has since closed).
+            with ledger.trusted(consumer_tag):
+                ret = super().basic_cancel(consumer_tag)
+            self._ledger_cancel_detail = None
+            if deferred_seq is not None:
+                ledger.mark_cancelled(consumer_tag)
+        else:
+            ret = super().basic_cancel(consumer_tag)
         self._update_queue_cycle()
         return ret
 

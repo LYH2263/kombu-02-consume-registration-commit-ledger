@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from itertools import count
 from typing import TYPE_CHECKING
 
 from .common import maybe_declare
 from .compression import compress
 from .connection import PooledConnection, is_connection, maybe_channel
+from .consume_ledger import (
+    KIND_CANCEL_WITHHELD,
+    KIND_CONSUME,
+    KIND_DETACH_REFUSED,
+    KIND_QUEUE_DETACH,
+    KIND_REVIVE,
+    PLANE_CONSUMER,
+    STATUS_COMMITTED,
+    STATUS_INVALIDATED,
+    STATUS_REFUSED,
+    STATUS_WITHHELD,
+    ConsumeLedgerProtected,
+    get_ledger,
+    ledger_for,
+)
 from .entity import Exchange, Queue, maybe_delivery_mode
 from .exceptions import ContentDisallowed
 from .serialization import dumps, prepare_accept_content
@@ -423,6 +439,7 @@ class Consumer:
 
     def revive(self, channel):
         """Revive consumer after connection loss."""
+        dead_tags = tuple(self._active_tags.items())
         self._active_tags.clear()
         channel = self.channel = maybe_channel(channel)
         # modify dict size while iterating over it is not allowed
@@ -437,6 +454,22 @@ class Consumer:
 
         if self.prefetch_count is not None:
             self.qos(prefetch_count=self.prefetch_count)
+
+        # The old tags died with the connection: they are invalidated, not
+        # cancelled, and no new tag is registered until consume() is called
+        # again explicitly.
+        ledger = ledger_for(self.channel)
+        if ledger is not None:
+            ledger.register_owner(self)
+            invalidated = ledger.invalidate_claims(
+                [tag for _, tag in dead_tags])
+            ledger.record(
+                plane=PLANE_CONSUMER, kind=KIND_REVIVE, owner=id(self),
+                status=STATUS_INVALIDATED,
+                invalidated=invalidated,
+                auto_declare=bool(self.auto_declare),
+                prefetch_count=self.prefetch_count,
+            )
 
     def declare(self):
         """Declare queues, exchanges and bindings.
@@ -520,25 +553,80 @@ class Consumer:
         ----
             This does not affect already delivered messages, but it does
             mean the server will not send any more messages for this consumer.
+
+        Inside an open consumption ledger scope, tags committed by an outer
+        scope are *withheld* (no ``basic_cancel`` is sent for them and their
+        mappings stay live) instead of being torn down by the inner scope.
+        ``cancel`` never removes queues: queue membership is only detached
+        through :meth:`cancel_by_queue`.
         """
+        ledger = ledger_for(self.channel)
+        if ledger is not None:
+            ledger.register_owner(self)
+        frame = ledger.top if ledger is not None else None
         cancel = self.channel.basic_cancel
-        for tag in self._active_tags.values():
-            cancel(tag)
-        self._active_tags.clear()
+        if frame is None:
+            for tag in self._active_tags.values():
+                cancel(tag)
+            self._active_tags.clear()
+            return
+        kept = {}
+        for qname, tag in self._active_tags.items():
+            if frame.protects_tag(tag):
+                # Committed before this frame opened: withhold rather than
+                # writing the inner cancel through the outer registration.
+                ledger.record(
+                    plane=PLANE_CONSUMER, kind=KIND_CANCEL_WITHHELD,
+                    owner=id(self), queue=qname, tag=tag,
+                    status=STATUS_WITHHELD, reason='outer_scope',
+                )
+                kept[qname] = tag
+            else:
+                cancel(tag)
+        self._active_tags = kept
 
     close = cancel
 
     def cancel_by_queue(self, queue):
-        """Cancel consumer by queue name."""
+        """Cancel consumer by queue name.
+
+        Unlike :meth:`cancel` this also detaches the queue from
+        ``_queues``; that detach is a permanent commit -- leaving a ledger
+        scope never re-attaches a queue that was popped here.  An inner
+        ledger scope may not detach queue membership committed by an outer
+        scope.
+        """
         qname = queue.name if isinstance(queue, Queue) else queue
+        ledger = ledger_for(self.channel)
+        if ledger is not None:
+            ledger.register_owner(self)
+        frame = ledger.top if ledger is not None else None
+        if frame is not None and frame.protects_queue(id(self), qname):
+            ledger.record(
+                plane=PLANE_CONSUMER, kind=KIND_DETACH_REFUSED,
+                owner=id(self), queue=qname, status=STATUS_REFUSED,
+                reason='outer_scope',
+            )
+            raise ConsumeLedgerProtected(
+                f'queue {qname!r} is attached by an outer consume-ledger '
+                f'scope (frame {frame.id}); close the inner scope before '
+                f'detaching it'
+            )
         try:
             tag = self._active_tags.pop(qname)
         except KeyError:
-            pass
+            tag = None
         else:
             self.channel.basic_cancel(tag)
-        finally:
-            self._queues.pop(qname, None)
+        self._queues.pop(qname, None)
+        if ledger is not None:
+            ledger.record(
+                plane=PLANE_CONSUMER, kind=KIND_QUEUE_DETACH,
+                owner=id(self), queue=qname, tag=tag,
+                status=STATUS_COMMITTED,
+                tag_cancelled=tag is not None,
+                register_seq=ledger.register_seq(tag) if tag else None,
+            )
 
     def consuming_from(self, queue):
         """Return :const:`True` if currently consuming from queue'."""
@@ -633,13 +721,46 @@ class Consumer:
             raise NotImplementedError('Consumer does not have any callbacks')
         [callback(body, message) for callback in callbacks]
 
+    def consume_ledger(self):
+        """Open a consumption registration & cancellation commit scope on
+        the channel of this consumer.
+
+        Yields the :class:`~kombu.consume_ledger.ConsumeLedger` (the frame
+        is available as ``ledger.top``).
+        """
+        @contextmanager
+        def _scope():
+            ledger = get_ledger(self.channel)
+            with ledger.scope(owner=self):
+                yield ledger
+        return _scope()
+
+    def _ledger_queue_names(self):
+        # Owner protocol for ConsumeLedger frame snapshots.
+        return set(self._queues)
+
+    def _ledger_latch(self):
+        # Consumers do not own a one-shot latch.
+        return False
+
     def _basic_consume(self, queue, consumer_tag=None,
                        no_ack=no_ack, nowait=True):
+        ledger = ledger_for(self.channel)
         tag = self._active_tags.get(queue.name)
         if tag is None:
             tag = self._add_tag(queue, consumer_tag)
+            if ledger is not None:
+                ledger.register_owner(self)
+                ledger.claim_tag(tag, queue.name, id(self))
             queue.consume(tag, self._receive_callback,
                           no_ack=no_ack, nowait=nowait)
+            if ledger is not None:
+                ledger.record(
+                    plane=PLANE_CONSUMER, kind=KIND_CONSUME,
+                    owner=id(self), queue=queue.name, tag=tag,
+                    status=STATUS_COMMITTED,
+                    nowait=bool(nowait), no_ack=bool(no_ack),
+                )
         return tag
 
     def _add_tag(self, queue, consumer_tag=None):

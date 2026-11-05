@@ -157,6 +157,12 @@ from kombu.asynchronous import get_event_loop
 from kombu.asynchronous.aws.ext import boto3, exceptions
 from kombu.asynchronous.aws.sqs.connection import AsyncSQSConnection
 from kombu.asynchronous.aws.sqs.message import AsyncMessage
+from kombu.consume_ledger import (
+    KIND_HUB_SCHEDULE,
+    PLANE_SQS,
+    authorize_cancel,
+    ledger_for,
+)
 from kombu.log import get_logger
 from kombu.utils import scheduling
 from kombu.utils.encoding import bytes_to_str, safe_str
@@ -319,6 +325,21 @@ class Channel(virtual.Channel):
             queue_name = url.split('/')[-1]
             self._queue_cache[queue_name] = url
 
+    def _ledger_consume_extra(self, queue, no_ack):
+        return {
+            'noack_add': bool(no_ack) and queue in self._noack_queues,
+            'hub_scheduled': bool(self.hub),
+        }
+
+    def _ledger_cancel_extra(self, consumer_tag, queue):
+        # SQS completion plane: _noack_queues discard is synchronous and
+        # there is no redis-style after_read deferral.
+        return {
+            'noack_discarded': self.__dict__.get(
+                '_ledger_noack_discarded', False),
+            'synchronous': True,
+        }
+
     def basic_consume(self, queue, no_ack, *args, **kwargs):
         if no_ack:
             self._noack_queues.add(queue)
@@ -329,8 +350,11 @@ class Channel(virtual.Channel):
         )
 
     def basic_cancel(self, consumer_tag):
+        self._ledger_noack_discarded = False
         if consumer_tag in self._consumers:
+            authorize_cancel(self, consumer_tag)
             queue = self._tag_to_queue[consumer_tag]
+            self._ledger_noack_discarded = queue in self._noack_queues
             self._noack_queues.discard(queue)
         return super().basic_cancel(consumer_tag)
 
@@ -621,6 +645,13 @@ class Channel(virtual.Channel):
         raise Empty()
 
     def _loop1(self, queue, _=None):
+        ledger = ledger_for(self)
+        if ledger is not None:
+            ledger.record(
+                plane=PLANE_SQS, kind=KIND_HUB_SCHEDULE,
+                owner=id(self), queue=queue, tag=None,
+                callback='_schedule_queue', via='call_soon',
+            )
         self.hub.call_soon(self._schedule_queue, queue)
 
     def _schedule_queue(self, queue):
